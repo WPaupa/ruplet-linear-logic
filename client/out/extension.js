@@ -93,6 +93,10 @@ function isMyPaEditor(editor) {
 function computeProofStateFromText(text) {
     const tacticNames = new Set([
         "init",
+        "sinit",
+        "strict_init",
+        "strict_trivial",
+        "strivial",
         "axiom",
         "split",
         "tensor",
@@ -102,6 +106,9 @@ function computeProofStateFromText(text) {
         "intro",
         "apply",
         "derelict",
+        "ederelict",
+        "elementary_derelict",
+        "copy",
         "left",
         "inl",
         "plus_left",
@@ -170,6 +177,13 @@ function computeProofStateFromText(text) {
             catch (err) {
                 engine.addError(lineNo, err.message);
             }
+            return;
+        }
+        const logicMatch = line.match(/^logic\s+(.+)$/i);
+        if (logicMatch) {
+            // logic flags apply only to the current theorem/engine; allow multiple flags on one line
+            const flags = logicMatch[1].trim();
+            engine.setLogicFlag(flags);
             return;
         }
         const tacticMatch = line.match(/^tactic\s+([^\s]+)(?:\s+(.*))?$/);
@@ -282,6 +296,8 @@ function activate(context) {
         "destruct",
         "cases",
         "init",
+        "sinit",
+        "strict_init",
         "axiom",
         "split",
         "tensor",
@@ -289,7 +305,13 @@ function activate(context) {
         "left",
         "right",
         "trivial",
+        "strict_trivial",
+        "strivial",
         "bang",
+        "copy",
+        "ederelict",
+        "elementary_derelict",
+        "logic",
         "intro",
         "apply",
         "derelict",
@@ -529,6 +551,7 @@ function cloneCtx(ctx) {
 }
 class ProofEngine {
     constructor() {
+        this.logicFlags = new Set();
         this.globalHyps = [];
         this.goals = [];
         this.errors = [];
@@ -545,6 +568,17 @@ class ProofEngine {
         };
         this.globalHyps.push(hyp);
         this.goals.forEach((g) => g.ctx.push({ ...hyp }));
+    }
+    // Set one or more logic flags for this engine (adds flags, does not clear existing)
+    setLogicFlag(mode) {
+        if (!mode)
+            return;
+        const parts = mode
+            .split(/\s+/)
+            .map((p) => p.trim().toLowerCase())
+            .filter(Boolean);
+        for (const p of parts)
+            this.logicFlags.add(p);
     }
     addGoal(target) {
         const goal = {
@@ -563,6 +597,17 @@ class ProofEngine {
         const goal = this.goals.shift();
         const ctx = goal.ctx;
         const target = goal.target;
+        // Enforce logic flags restrictions
+        if (this.logicFlags.has("linear") && (normalized === "init" || normalized === "axiom" || normalized === "trivial")) {
+            this.addError(line, `init/axiom/trivial is not allowed under logic linear; use strict_init/sinit and strict_trivial/strivial instead.`);
+            this.goals.unshift(goal);
+            return;
+        }
+        if (this.logicFlags.has("elementary") && (normalized === "bang" || normalized === "!" || normalized === "derelict")) {
+            this.addError(line, `bang/derelict is not allowed under logic elementary; use copy and elementary_derelict/ederelict instead.`);
+            this.goals.unshift(goal);
+            return;
+        }
         const mkGoal = (f, updatedCtx = ctx) => ({
             id: `g${++this.goalCounter}`,
             ctx: cloneCtx(updatedCtx),
@@ -588,6 +633,27 @@ class ProofEngine {
                     : "No hypothesis matches current goal.");
                 this.goals.unshift(goal);
                 return;
+            }
+            putBack([]);
+        };
+        const closeWithHypStrict = (hypName) => {
+            const hyp = ensureHyp(hypName);
+            if (!hyp) {
+                this.addError(line, hypName
+                    ? `Hypothesis "${hypName}" does not match current goal.`
+                    : "No hypothesis matches current goal.");
+                this.goals.unshift(goal);
+                return;
+            }
+            // All other hypotheses must be bangs
+            for (const h of ctx) {
+                if (h.name === hyp.name)
+                    continue;
+                if (h.formula.kind !== "bang") {
+                    this.addError(line, `strict_init requires all other hypotheses to be bangs.`);
+                    this.goals.unshift(goal);
+                    return;
+                }
             }
             putBack([]);
         };
@@ -681,6 +747,10 @@ class ProofEngine {
             this.goals.unshift(goal);
         };
         switch (normalized) {
+            case "sinit":
+            case "strict_init":
+                closeWithHypStrict(argWords[0]);
+                return;
             case "init":
             case "axiom":
                 closeWithHyp(argWords[0]);
@@ -787,9 +857,54 @@ class ProofEngine {
                 this.addError(line, "bang applies only to ! goals or as `bang <hyp>` for dereliction.");
                 this.goals.unshift(goal);
                 return;
+            case "copy": {
+                if (argWords.length < 1) {
+                    this.addError(line, "copy requires a hypothesis name.");
+                    this.goals.unshift(goal);
+                    return;
+                }
+                const hName = argWords[0];
+                const hIdx = ctx.findIndex((h) => h.name === hName);
+                if (hIdx === -1) {
+                    this.addError(line, `Unknown hypothesis "${hName}".`);
+                    this.goals.unshift(goal);
+                    return;
+                }
+                const hyp = ctx[hIdx];
+                if (hyp.formula.kind !== "bang") {
+                    this.addError(line, `Hypothesis "${hName}" is not a bang and cannot be copied.`);
+                    this.goals.unshift(goal);
+                    return;
+                }
+                let base = `${hName}_copy`;
+                let suffix = 1;
+                let candidate = base;
+                while (ctx.some((h) => h.name === candidate)) {
+                    suffix += 1;
+                    candidate = `${base}${suffix}`;
+                }
+                // copy the exact hypothesis (including the bang)
+                ctx.push({ name: candidate, type: renderFormula(hyp.formula), formula: hyp.formula });
+                putBack([{ ...goal, ctx: cloneCtx(ctx) }]);
+                return;
+            }
             case "quest":
             case "?":
                 this.addError(line, "Unknown tactic \"?\".");
+                this.goals.unshift(goal);
+                return;
+            case "strict_trivial":
+            case "strivial":
+                if (target.kind === "one" || target.kind === "top") {
+                    if (!ctx.every((h) => h.formula.kind === "bang")) {
+                        this.addError(line, "strict_trivial requires all assumptions to be bangs.");
+                        this.goals.unshift(goal);
+                        return;
+                    }
+                    putBack([]);
+                    return;
+                }
+                this.addError(line, "strict_trivial only solves 1 or ⊤.");
                 this.goals.unshift(goal);
                 return;
             case "trivial":
@@ -812,6 +927,21 @@ class ProofEngine {
                     return;
                 }
                 this.addError(line, "derelict applies only to ! goals.");
+                this.goals.unshift(goal);
+                return;
+            case "ederelict":
+            case "elementary_derelict":
+                if (target.kind === "bang") {
+                    if (!ctx.every((h) => h.formula.kind === "bang")) {
+                        this.addError(line, "elementary_derelict requires all assumptions to be bangs.");
+                        this.goals.unshift(goal);
+                        return;
+                    }
+                    const newCtx = ctx.map((h) => ({ name: h.name, type: renderFormula(h.formula.of), formula: h.formula.of }));
+                    putBack([mkGoal(target.of, newCtx)]);
+                    return;
+                }
+                this.addError(line, "elementary_derelict applies only to ! goals.");
                 this.goals.unshift(goal);
                 return;
             case "destruct":
